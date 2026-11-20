@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+*.pyc
+dataset/
+dataset_rejected/
+raw/
+outputs/
+.vscode/

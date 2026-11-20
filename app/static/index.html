@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link rel="icon" href="data:,">
+<title>LockLog</title>
+<style>
+:root{--bg:#f4f6f5;--card:#fff;--ink:#16211e;--mute:#5d6b67;--line:#dce2df;--accent:#0f766e;--ok:#15803d;--warn:#b45309;
+  box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:dark){:root{--bg:#101615;--card:#1a2321;--ink:#e8eeec;--mute:#9aaaa5;--line:#2c3a36;--accent:#4fd1c0;--ok:#6ee7a0;--warn:#fbbf6a}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.6 -apple-system,"Hiragino Sans","Noto Sans JP",sans-serif}
+main{max-width:480px;margin:0 auto;padding:18px 16px 40px}
+h1{font-size:1.3rem;margin:0}
+.sub{margin:0 0 14px;color:var(--mute);font-size:.88rem}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px;margin-bottom:12px}
+.k{font-size:.8rem;color:var(--mute)}
+.big{font-size:2.2rem;font-weight:700;line-height:1.3}
+.big.locked{color:var(--ok)}.big.unlocked{color:var(--warn)}
+.row{display:flex;gap:8px;margin:12px 0 4px}
+button{flex:1;font:inherit;font-weight:600;font-size:.92rem;padding:12px 6px;border-radius:10px;border:1px solid var(--line);background:var(--card);color:var(--ink)}
+button.go{background:var(--accent);border-color:var(--accent);color:#fff;font-size:1rem}
+button:disabled{opacity:.45}
+button:focus-visible{outline:3px solid var(--accent);outline-offset:2px}
+.bar{height:14px;border-radius:7px;background:var(--line);overflow:hidden;margin-top:12px}
+.bar i{display:block;height:100%;width:0;background:var(--accent)}
+#msg{min-height:1.6em;margin:8px 0 0;font-size:.88rem;color:var(--mute)}
+ul{list-style:none;margin:8px 0 0;padding:0;font-size:.9rem}
+li{display:flex;justify-content:space-between;gap:10px;padding:7px 0;border-top:1px solid var(--line)}
+li span:last-child{color:var(--mute);font-variant-numeric:tabular-nums;white-space:nowrap}
+.note{font-size:.8rem;color:var(--mute);margin:6px 0 0}
+</style>
+</head>
+<body>
+<main>
+  <h1>LockLog</h1>
+  <p class="sub">鍵の音を聞いて、施錠の状態を記録します</p>
+
+  <section class="card">
+    <div class="k">鍵の状態</div>
+    <div class="big" id="state" role="status">状態を選んでください</div>
+    <div class="k" id="stateTime"></div>
+    <div class="row"><button id="setLocked">施錠済みにする</button><button id="setUnlocked">開錠中にする</button></div>
+    <div class="row" style="margin-top:0"><button id="undo">直前の変更を取り消す</button></div>
+  </section>
+
+  <section class="card">
+    <div class="row" style="margin-top:0"><button class="go" id="start">マイクを開始</button><button id="stop" disabled>停止</button></div>
+    <div class="bar"><i id="fill"></i></div>
+    <p id="msg"></p>
+    <p class="note">画面を点けたまま使います。Bluetoothイヤホンは外してください。鍵の音を検出するたびに、状態が切り替わります。</p>
+  </section>
+
+  <section class="card">
+    <div class="k">サンプル音で試す（マイク不要）</div>
+    <div class="row">
+      <button data-demo="lock">施錠音</button><button data-demo="unlock">開錠音</button>
+      <button data-demo="door">ドア</button><button data-demo="other">その他</button>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="k">履歴</div>
+    <ul id="hist"></ul>
+    <div class="row"><button id="clear">履歴を消す</button></div>
+  </section>
+</main>
+
+<script>
+(function(){
+  var $ = function(id){return document.getElementById(id)};
+  var STATE_KEY = "locklog-state2", HIST_KEY = "locklog-history2";
+  var MERGE_MS = 8000, MAXH = 60;                         // 8秒以内に続いた鍵の音は、1回の操作とみなす
+  var PRE = 1.0, POST = 2.0, PEAKWIN = 0.6, COOL = 0.5;   // 切り出し: 最大音の前1秒・後2秒
+  var JA = {locked:"施錠済み", unlocked:"開錠中"};
+
+  function loadJSON(key, fallback){try{var v = JSON.parse(localStorage.getItem(key)); return v || fallback}catch(e){return fallback}}
+  var st = loadJSON(STATE_KEY, {s:null, t:0, stack:[]});
+  var hist = loadJSON(HIST_KEY, []);
+  var lastKeyAt = 0;
+  var stream, ctx, proc, wake, ring, rate, total, noise, blocks, mode = "off", trig, peakV, peakAt, coolUntil;
+
+  function saveAll(){try{localStorage.setItem(STATE_KEY,JSON.stringify(st));localStorage.setItem(HIST_KEY,JSON.stringify(hist))}catch(e){}}
+  function hm(t){var d=new Date(t);return String(d.getHours()).padStart(2,"0")+":"+String(d.getMinutes()).padStart(2,"0")}
+  function ago(t){var m=Math.floor((Date.now()-t)/60000);return m<1?"たった今":m<60?m+"分前":Math.floor(m/60)+"時間前"}
+  function msg(t){$("msg").textContent = t}
+
+  var TEXT = {
+    toggle: function(h){return h.s ? "鍵の操作 → "+JA[h.s] : "鍵の操作を検出（状態は不明）"},
+    merge:  function(){return "鍵の音（直前の操作と同じとみなす）"},
+    other:  function(){return "鍵ではない音"},
+    manual: function(h){return "手動で「"+JA[h.s]+"」に変更"},
+    undo:   function(){return "変更を取り消し"}
+  };
+
+  function render(){
+    var s = $("state");
+    if(st.s){s.textContent = JA[st.s]; s.className = "big "+st.s; $("stateTime").textContent = hm(st.t)+"（"+ago(st.t)+"）・音からの推定です"}
+    else{s.textContent = "状態を選んでください"; s.className = "big"; $("stateTime").textContent = "下のボタンで、今の状態を教えてください"}
+    $("hist").innerHTML = hist.map(function(h){
+      return "<li><span>"+TEXT[h.k](h)+"</span><span>"+hm(h.t)+(h.c?" ・ "+Math.round(h.c*100)+"%":"")+"</span></li>";
+    }).join("") || "<li><span>まだありません</span><span></span></li>";
+  }
+
+  function push(){st.stack.push({s:st.s, t:st.t}); if(st.stack.length>10) st.stack.shift()}
+  function log(kind, conf){hist.unshift({t:Date.now(), k:kind, s:st.s, c:conf||0}); hist = hist.slice(0, MAXH)}
+  function done(){saveAll(); render()}
+
+  function onKey(conf){
+    var now = Date.now();
+    if(lastKeyAt && now-lastKeyAt < MERGE_MS){log("merge", conf); done(); return}
+    lastKeyAt = now; push();
+    if(st.s === "locked") st.s = "unlocked"; else if(st.s === "unlocked") st.s = "locked";
+    st.t = now; log("toggle", conf); done();
+  }
+  function setManual(s){push(); st.s = s; st.t = Date.now(); lastKeyAt = 0; log("manual"); done()}
+  function undo(){
+    var prev = st.stack.pop();
+    if(!prev){msg("取り消せる変更がありません"); return}
+    st.s = prev.s; st.t = prev.t; lastKeyAt = 0; log("undo"); done();
+  }
+
+  async function judge(clip, sr, fromDemo){
+    msg("判定中…");
+    var pcm = new Int16Array(clip.length);
+    for(var i=0;i<clip.length;i++){var v=Math.max(-1,Math.min(1,clip[i]));pcm[i]=v<0?v*32768:v*32767}
+    try{
+      var r = await fetch("/api/predict?sample_rate="+sr,{method:"POST",headers:{"Content-Type":"application/octet-stream"},body:pcm.buffer});
+      if(!r.ok){var e = await r.json().catch(function(){return {}}); msg("判定できませんでした: "+(e.detail||r.status)); return}
+      var res = await r.json();
+      if(fromDemo) lastKeyAt = 0;                       // サンプルのボタンは、毎回1回の操作として扱う
+      if(res.decision === "key") onKey(res.confidence); else {log("other", res.confidence); done()}
+      msg(mode==="off" ? "" : "待機中…音を待っています");
+    }catch(e){msg("サーバーに接続できません")}
+  }
+
+  function slice(from, to){var out = new Float32Array(to-from); for(var i=0;i<out.length;i++) out[i] = ring[(from+i)%ring.length]; return out}
+
+  function onAudio(ev){
+    var x = ev.inputBuffer.getChannelData(0), n = x.length, sum = 0, pk = 0, pkI = 0;
+    for(var i=0;i<n;i++){var v=x[i]; ring[(total+i)%ring.length]=v; sum+=v*v; var a=Math.abs(v); if(a>pk){pk=a; pkI=i}}
+    var rms = Math.sqrt(sum/n), start = total;
+    total += n;
+    $("fill").style.width = Math.max(0,Math.min(100,(20*Math.log10(pk+1e-9)+60)/60*100))+"%";
+
+    if(mode === "idle"){
+      blocks++;
+      if(blocks <= 5){noise = noise ? (noise+rms)/2 : rms; return}          // 最初の数ブロックで静けさを測る
+      if(rms > Math.max(noise*6, 0.005) && total > rate*(PRE+0.2)){mode="peak"; trig=start; peakV=0; peakAt=0; msg("音を検出しました…")}
+      else{noise = noise*0.98 + rms*0.02}
+    }
+    if(mode === "peak"){
+      if(pk > peakV){peakV = pk; peakAt = start+pkI}
+      if(total >= trig+PEAKWIN*rate) mode = "wait";
+    }
+    if(mode === "wait" && total >= peakAt+POST*rate){
+      var clip = slice(Math.round(peakAt-PRE*rate), Math.round(peakAt+POST*rate));
+      mode = "cool"; coolUntil = peakAt+(POST+COOL)*rate;
+      judge(clip, rate, false);
+    }
+    if(mode === "cool" && total >= coolUntil){mode = "idle"}
+  }
+
+  async function getWake(){
+    if(!("wakeLock" in navigator)) return;
+    try{wake = await navigator.wakeLock.request("screen")}catch(e){}
+  }
+
+  async function start(){
+    $("start").disabled = true;
+    try{
+      stream = await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false,channelCount:1}});
+    }catch(e){msg("マイクを使えません（"+e.name+"）。ブラウザの設定でマイクを許可してください。"); $("start").disabled = false; return}
+    var AC = window.AudioContext || window.webkitAudioContext;
+    ctx = new AC(); await ctx.resume();
+    rate = ctx.sampleRate; ring = new Float32Array(Math.ceil(rate*5)); total = 0; noise = 0; blocks = 0;
+    var src = ctx.createMediaStreamSource(stream);
+    proc = ctx.createScriptProcessor(2048,1,1);
+    proc.onaudioprocess = onAudio;
+    var mute = ctx.createGain(); mute.gain.value = 0;
+    src.connect(proc); proc.connect(mute); mute.connect(ctx.destination);
+    mode = "idle"; $("stop").disabled = false;
+    await getWake();
+    msg(rate<24000 ? "サンプリングレートが低い("+rate+"Hz)です。Bluetoothを外してください。" : "待機中…音を待っています ("+rate+"Hz)");
+  }
+
+  function stop(){
+    mode = "off";
+    if(proc){proc.disconnect(); proc.onaudioprocess = null}
+    if(stream) stream.getTracks().forEach(function(t){t.stop()});
+    if(ctx) ctx.close();
+    if(wake){wake.release().catch(function(){}); wake = null}
+    $("fill").style.width = "0"; $("start").disabled = false; $("stop").disabled = true; msg("停止しました");
+  }
+
+  async function demo(name){
+    msg("サンプルを読み込み中…");
+    try{
+      var r = await fetch("samples/"+name+".wav"); if(!r.ok) throw new Error("none");
+      var AC = window.AudioContext || window.webkitAudioContext, c = new AC();
+      var audio = await c.decodeAudioData(await r.arrayBuffer()); c.close();
+      var ch = audio.getChannelData(0);
+      await judge(ch.slice(0, Math.min(ch.length, Math.round(audio.sampleRate*6))), audio.sampleRate, true);
+    }catch(e){msg("サンプル音源が見つかりません（app/static/samples/"+name+".wav）")}
+  }
+
+  $("start").addEventListener("click", start);
+  $("stop").addEventListener("click", stop);
+  $("setLocked").addEventListener("click", function(){setManual("locked")});
+  $("setUnlocked").addEventListener("click", function(){setManual("unlocked")});
+  $("undo").addEventListener("click", undo);
+  $("clear").addEventListener("click", function(){hist = []; done()});
+  document.querySelectorAll("[data-demo]").forEach(function(b){b.addEventListener("click", function(){demo(b.dataset.demo)})});
+  document.addEventListener("visibilitychange", function(){if(!document.hidden && mode!=="off" && (!wake || wake.released)) getWake(); render()});
+  setInterval(render, 30000);
+  render();
+})();
+</script>
+</body>
+</html>

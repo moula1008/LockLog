@@ -1,0 +1,130 @@
+from pathlib import Path
+
+import joblib
+import numpy as np
+import pandas as pd
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+from sklearn.model_selection import StratifiedGroupKFold, cross_val_predict
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.svm import SVC
+
+from features import POST_SEC, PRE_SEC, TARGET_SR
+
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+FEATURES_PATH = BASE_DIR / "dataset" / "mfcc_features.csv"
+MODEL_DIR = BASE_DIR / "models"
+MODEL_PATH = MODEL_DIR / "locklog_model.joblib"
+EXPECTED_LABELS = ("lock", "unlock", "door", "other")
+KEY_LABELS = ("lock", "unlock")   # この2つを「鍵の操作(key)」にまとめる
+RANDOM_STATE = 42
+N_SPLITS = 5
+N_REPEATS = 5
+THRESHOLDS = (0.3, 0.4, 0.5, 0.6, 0.7, 0.8)
+
+
+def make_model():
+    svm = SVC(kernel="rbf", class_weight="balanced")
+    return make_pipeline(
+        StandardScaler(),
+        CalibratedClassifierCV(svm, method="sigmoid", cv=3, ensemble=False),
+    )
+
+
+def main():
+    if not FEATURES_PATH.is_file():
+        print(f"特徴量CSVがありません: {FEATURES_PATH}")
+        print("先に python script/extract_features.py を実行してください。")
+        return
+
+    data = pd.read_csv(FEATURES_PATH)
+    if not {"label", "file", "group"}.issubset(data.columns):
+        print("CSVにlabel/file/group列がありません。extract_features.py を再実行してください。")
+        return
+
+    feature_columns = [c for c in data.columns if c not in ("label", "file", "group")]
+    if not feature_columns or data[feature_columns].isna().any().any():
+        print("特徴量の列がない、または空欄があります。extract_features.py を再実行してください。")
+        return
+
+    data["label"] = data["label"].astype(str)
+    unexpected = sorted(set(data["label"]) - set(EXPECTED_LABELS))
+    if unexpected:
+        print("想定外のラベルがあります:", ", ".join(unexpected))
+        return
+
+    counts = data["label"].value_counts()
+    print("=== LockLog 分類モデル（鍵の操作 or それ以外）===")
+    print("特徴量:", len(feature_columns), "個 / 録音の単位(group):", data["group"].nunique(), "個")
+    for label in EXPECTED_LABELS:
+        mark = "→ key" if label in KEY_LABELS else "→ other"
+        print(f"  {label}: {int(counts.get(label, 0))}件 {mark}")
+    if any(counts.get(label, 0) < N_SPLITS for label in EXPECTED_LABELS):
+        print(f"各ラベルに最低{N_SPLITS}件必要です。音声を追加してから実行してください。")
+        return
+
+    X = data[feature_columns].astype(float)
+    original = data["label"].to_numpy()
+    y = np.where(np.isin(original, KEY_LABELS), "key", "other")
+    groups = data["group"].to_numpy()
+    classes = np.array(["key", "other"])
+    key_index = 0
+
+    accuracies = []
+    for repeat in range(N_REPEATS):
+        cv = StratifiedGroupKFold(n_splits=N_SPLITS, shuffle=True, random_state=RANDOM_STATE + repeat)
+        probabilities = cross_val_predict(make_model(), X, y, cv=cv, groups=groups, method="predict_proba")
+        accuracies.append(accuracy_score(y, classes[probabilities.argmax(axis=1)]))
+        if repeat == 0:
+            first = probabilities
+    predictions = classes[first.argmax(axis=1)]
+    p_key = first[:, key_index]
+
+    print(f"\n=== 交差検証（録音ごとに分割・{N_SPLITS}分割×{N_REPEATS}回） ===")
+    print(f"正解率: {np.mean(accuracies):.3f} (±{np.std(accuracies):.3f})")
+    print("\nクラス別の評価（1回目の分割）:")
+    print(classification_report(y, predictions, labels=list(classes), zero_division=0))
+    print("混同行列（行=正解、列=予測） 順番: key / other")
+    print(confusion_matrix(y, predictions, labels=list(classes)))
+
+    print("\n元のラベルごとの「key」と判定された割合（1回目の分割）:")
+    for label in EXPECTED_LABELS:
+        mask = original == label
+        print(f"  {label:<7} {(predictions[mask] == 'key').mean():6.1%}  ({int(mask.sum())}件)")
+
+    print("\n=== しきい値（keyの確率）と、見逃し・誤検出（1回目の分割） ===")
+    print("しきい値 | 鍵の音を検出できた割合 | doorを誤検出 | otherを誤検出")
+    for threshold in THRESHOLDS:
+        detected = p_key >= threshold
+        print(
+            f"  {threshold:.1f}    |        {detected[y == 'key'].mean():6.1%}         |"
+            f"   {detected[original == 'door'].mean():6.1%}   |   {detected[original == 'other'].mean():6.1%}"
+        )
+
+    wrong = np.flatnonzero(predictions != y)
+    print(f"\n誤分類したファイル（1回目の分割）: {wrong.size}件")
+    for index in wrong:
+        print(f"  {original[index]}/{data.loc[index, 'file']}: 予測={predictions[index]} (keyの確率 {p_key[index]:.2f})")
+
+    model = make_model()
+    model.fit(X, y)
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    joblib.dump(
+        {
+            "pipeline": model,
+            "feature_columns": feature_columns,
+            "labels": list(EXPECTED_LABELS),
+            "classes": [str(name) for name in model.classes_],
+            "mode": "key",
+            "sample_rate": TARGET_SR,
+            "crop_seconds": (PRE_SEC, POST_SEC),
+        },
+        MODEL_PATH,
+    )
+    print(f"\n全{len(data)}件で学習したモデルを保存しました: {MODEL_PATH}")
+
+
+if __name__ == "__main__":
+    main()
