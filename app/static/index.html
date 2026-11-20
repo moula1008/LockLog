@@ -65,6 +65,12 @@ li span:last-child{color:var(--mute);font-variant-numeric:tabular-nums;white-spa
     <ul id="hist"></ul>
     <div class="row"><button id="clear">履歴を消す</button></div>
   </section>
+
+  <section class="card">
+    <div class="k">診断ログ（不具合の調査用）</div>
+    <pre id="dlog" style="margin:8px 0 0;font:12px/1.5 ui-monospace,Menlo,monospace;max-height:220px;overflow:auto;white-space:pre-wrap;word-break:break-all">まだありません</pre>
+    <div class="row"><button id="copyLog">ログをコピー</button></div>
+  </section>
 </main>
 
 <script>
@@ -85,6 +91,13 @@ li span:last-child{color:var(--mute);font-variant-numeric:tabular-nums;white-spa
   function hm(t){var d=new Date(t);return String(d.getHours()).padStart(2,"0")+":"+String(d.getMinutes()).padStart(2,"0")}
   function ago(t){var m=Math.floor((Date.now()-t)/60000);return m<1?"たった今":m<60?m+"分前":Math.floor(m/60)+"時間前"}
   function msg(t){$("msg").textContent = t}
+  var dl = [];
+  function dlog(t){
+    var d = new Date(), p = function(n){return String(n).padStart(2,"0")};
+    dl.push(p(d.getHours())+":"+p(d.getMinutes())+":"+p(d.getSeconds())+" "+t);
+    if(dl.length > 80) dl.shift();
+    $("dlog").textContent = dl.join("\n"); $("dlog").scrollTop = $("dlog").scrollHeight;
+  }
 
   var TEXT = {
     toggle: function(h){return h.s ? "鍵の操作 → "+JA[h.s] : "鍵の操作を検出（状態は不明）"},
@@ -99,7 +112,8 @@ li span:last-child{color:var(--mute);font-variant-numeric:tabular-nums;white-spa
     if(st.s){s.textContent = JA[st.s]; s.className = "big "+st.s; $("stateTime").textContent = hm(st.t)+"（"+ago(st.t)+"）・音からの推定です"}
     else{s.textContent = "状態を選んでください"; s.className = "big"; $("stateTime").textContent = "下のボタンで、今の状態を教えてください"}
     $("hist").innerHTML = hist.map(function(h){
-      return "<li><span>"+TEXT[h.k](h)+"</span><span>"+hm(h.t)+(h.c?" ・ "+Math.round(h.c*100)+"%":"")+"</span></li>";
+      var showP = h.k === "toggle" || h.k === "merge" || h.k === "other";
+      return "<li><span>"+TEXT[h.k](h)+"</span><span>"+hm(h.t)+(showP?" ・ 鍵の確率 "+Math.round(h.c*100)+"%":"")+"</span></li>";
     }).join("") || "<li><span>まだありません</span><span></span></li>";
   }
 
@@ -125,14 +139,17 @@ li span:last-child{color:var(--mute);font-variant-numeric:tabular-nums;white-spa
     msg("判定中…");
     var pcm = new Int16Array(clip.length);
     for(var i=0;i<clip.length;i++){var v=Math.max(-1,Math.min(1,clip[i]));pcm[i]=v<0?v*32768:v*32767}
+    var ctl = new AbortController(), timer = setTimeout(function(){ctl.abort()}, 60000);
     try{
-      var r = await fetch("/api/predict?sample_rate="+sr,{method:"POST",headers:{"Content-Type":"application/octet-stream"},body:pcm.buffer});
-      if(!r.ok){var e = await r.json().catch(function(){return {}}); msg("判定できませんでした: "+(e.detail||r.status)); return}
+      var r = await fetch("/api/predict?sample_rate="+sr,{method:"POST",headers:{"Content-Type":"application/octet-stream"},body:pcm.buffer,signal:ctl.signal});
+      clearTimeout(timer);
+      if(!r.ok){var e = await r.json().catch(function(){return {}}); dlog("応答エラー "+r.status+" "+(e.detail||"")); msg("判定できませんでした: "+(e.detail||r.status)); return}
       var res = await r.json();
+      dlog("応答 "+res.decision+" (鍵の確率 "+Math.round(res.confidence*100)+"%)");
       if(fromDemo) lastKeyAt = 0;                       // サンプルのボタンは、毎回1回の操作として扱う
       if(res.decision === "key") onKey(res.confidence); else {log("other", res.confidence); done()}
       msg(mode==="off" ? "" : "待機中…音を待っています");
-    }catch(e){msg("サーバーに接続できません")}
+    }catch(e){clearTimeout(timer); dlog("通信または処理のエラー: "+e); msg("判定に失敗しました（診断ログを見てください）")}
   }
 
   function slice(from, to){var out = new Float32Array(to-from); for(var i=0;i<out.length;i++) out[i] = ring[(from+i)%ring.length]; return out}
@@ -147,7 +164,7 @@ li span:last-child{color:var(--mute);font-variant-numeric:tabular-nums;white-spa
     if(mode === "idle"){
       blocks++;
       if(blocks <= 5){noise = noise ? (noise+rms)/2 : rms; return}          // 最初の数ブロックで静けさを測る
-      if(rms > Math.max(noise*6, 0.005) && total > rate*(PRE+0.2)){mode="peak"; trig=start; peakV=0; peakAt=0; msg("音を検出しました…")}
+      if(rms > Math.max(noise*6, 0.005) && total > rate*(PRE+0.2)){mode="peak"; trig=start; peakV=0; peakAt=0; msg("音を検出しました…"); dlog("検出 rms="+rms.toFixed(4)+" しきい値="+Math.max(noise*6,0.005).toFixed(4))}
       else{noise = noise*0.98 + rms*0.02}
     }
     if(mode === "peak"){
@@ -157,6 +174,7 @@ li span:last-child{color:var(--mute);font-variant-numeric:tabular-nums;white-spa
     if(mode === "wait" && total >= peakAt+POST*rate){
       var clip = slice(Math.round(peakAt-PRE*rate), Math.round(peakAt+POST*rate));
       mode = "cool"; coolUntil = peakAt+(POST+COOL)*rate;
+      dlog("送信 最大音量="+peakV.toFixed(3)+" / "+clip.length+"サンプル");
       judge(clip, rate, false);
     }
     if(mode === "cool" && total >= coolUntil){mode = "idle"}
@@ -172,8 +190,13 @@ li span:last-child{color:var(--mute);font-variant-numeric:tabular-nums;white-spa
     try{
       stream = await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false,channelCount:1}});
     }catch(e){msg("マイクを使えません（"+e.name+"）。ブラウザの設定でマイクを許可してください。"); $("start").disabled = false; return}
+    var tr = stream.getAudioTracks()[0];
+    tr.addEventListener("ended", function(){dlog("マイクが終了しました")});
+    tr.addEventListener("mute", function(){dlog("マイクがミュートされました")});
+    tr.addEventListener("unmute", function(){dlog("マイクのミュートが解除されました")});
     var AC = window.AudioContext || window.webkitAudioContext;
     ctx = new AC(); await ctx.resume();
+    ctx.onstatechange = function(){dlog("AudioContext: "+ctx.state)};
     rate = ctx.sampleRate; ring = new Float32Array(Math.ceil(rate*5)); total = 0; noise = 0; blocks = 0;
     var src = ctx.createMediaStreamSource(stream);
     proc = ctx.createScriptProcessor(2048,1,1);
@@ -182,6 +205,7 @@ li span:last-child{color:var(--mute);font-variant-numeric:tabular-nums;white-spa
     src.connect(proc); proc.connect(mute); mute.connect(ctx.destination);
     mode = "idle"; $("stop").disabled = false;
     await getWake();
+    dlog("マイク開始 "+rate+"Hz / 画面の消灯防止: "+(wake ? "有効" : "無効"));
     msg(rate<24000 ? "サンプリングレートが低い("+rate+"Hz)です。Bluetoothを外してください。" : "待機中…音を待っています ("+rate+"Hz)");
   }
 
@@ -211,8 +235,13 @@ li span:last-child{color:var(--mute);font-variant-numeric:tabular-nums;white-spa
   $("setUnlocked").addEventListener("click", function(){setManual("unlocked")});
   $("undo").addEventListener("click", undo);
   $("clear").addEventListener("click", function(){hist = []; done()});
+  $("copyLog").addEventListener("click", function(){
+    var text = dl.join("\n");
+    if(navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(function(){msg("ログをコピーしました")}, function(){msg("コピーできません。ログを長押しして選択してください")});
+    else msg("コピーできません。ログを長押しして選択してください");
+  });
   document.querySelectorAll("[data-demo]").forEach(function(b){b.addEventListener("click", function(){demo(b.dataset.demo)})});
-  document.addEventListener("visibilitychange", function(){if(!document.hidden && mode!=="off" && (!wake || wake.released)) getWake(); render()});
+  document.addEventListener("visibilitychange", function(){dlog("ページが"+(document.hidden?"非表示":"表示")+"になりました（状態: "+mode+"）"); if(!document.hidden && mode!=="off" && (!wake || wake.released)) getWake(); render()});
   setInterval(render, 30000);
   render();
 })();

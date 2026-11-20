@@ -131,6 +131,11 @@ def main():
         help="raw/session/ の録音を、音の順番でラベル付けする。例: unlock,lock（この順に繰り返す）",
     )
     parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="検出数が、期待や順番と合わないときは、保存せずに止まる（指定しないときは、そのまま保存する）",
+    )
+    parser.add_argument(
         "--fixed",
         action="store_true",
         help="音が続く録音向け。先頭から3秒ごとに区切る（静かな区間は捨てる）",
@@ -195,11 +200,15 @@ def main():
                 print("  検出できなかったので、スキップします。--factor を小さくしてみてください。")
                 continue
             if args.expect is not None and len(clips) != args.expect:
-                print(f"  期待({args.expect}件)と違うので保存しません。--factor を調整するか、--dry-run で確認してください。")
-                continue
+                if args.strict:
+                    print(f"  期待({args.expect}件)と違うので保存しません。--factor を調整するか、--dry-run で確認してください。")
+                    continue
+                print(f"  ※ 期待({args.expect}件)と違いますが、保存します。")
             if sequence and len(clips) % len(sequence) != 0:
-                print(f"  検出数が、順番({args.sequence})の繰り返しに合わないので保存しません。--dry-run で確認してください。")
-                continue
+                if args.strict:
+                    print(f"  検出数が、順番({args.sequence})の繰り返しに合わないので保存しません。--dry-run で確認してください。")
+                    continue
+                print("  ※ 検出数が順番の繰り返しに合いませんが、保存します（lock/unlockの振り分けがずれても、鍵の音の学習には影響しません）。")
 
             saved_labels = []
             for (_, _, clip, complete), label in zip(clips, labels):
