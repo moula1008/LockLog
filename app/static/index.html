@@ -66,6 +66,16 @@ li span:last-child{color:var(--mute);font-variant-numeric:tabular-nums;white-spa
     <div class="row"><button id="clear">履歴を消す</button></div>
   </section>
 
+  <section class="card" id="collect" hidden>
+    <div class="k">収集モード（データ集め用）</div>
+    <p class="note" style="margin-top:4px">音を検出するたびに、直前のクリップへラベルを付けて貯めます。クリップはこの端末の中だけに保存され、サーバーには保存されません。</p>
+    <div id="pendingInfo" class="k" style="margin-top:8px">直前のクリップ: なし</div>
+    <div class="row"><button data-label="lock" disabled>施錠</button><button data-label="unlock" disabled>開錠</button><button data-label="door" disabled>ドア</button></div>
+    <div class="row" style="margin-top:0"><button data-label="other" disabled>その他</button><button data-label="" disabled>捨てる</button></div>
+    <div id="counts" class="k" style="margin-top:8px">貯めた数: 0件</div>
+    <div class="row"><button id="saveZip">ZIPで保存</button><button id="clearStore">全部消す</button></div>
+  </section>
+
   <section class="card">
     <div class="k">診断ログ（不具合の調査用）</div>
     <pre id="dlog" style="margin:8px 0 0;font:12px/1.5 ui-monospace,Menlo,monospace;max-height:220px;overflow:auto;white-space:pre-wrap;word-break:break-all">まだありません</pre>
@@ -79,13 +89,14 @@ li span:last-child{color:var(--mute);font-variant-numeric:tabular-nums;white-spa
   var STATE_KEY = "locklog-state2", HIST_KEY = "locklog-history2";
   var MERGE_MS = 8000, MAXH = 60;                         // 8秒以内に続いた鍵の音は、1回の操作とみなす
   var PRE = 1.0, POST = 2.0, PEAKWIN = 0.6, COOL = 0.5;   // 切り出し: 最大音の前1秒・後2秒
+  var MIN_SEND_PEAK = 0.04;                                // これより小さい音は、雑音とみなして送らない
   var JA = {locked:"施錠済み", unlocked:"開錠中"};
 
   function loadJSON(key, fallback){try{var v = JSON.parse(localStorage.getItem(key)); return v || fallback}catch(e){return fallback}}
   var st = loadJSON(STATE_KEY, {s:null, t:0, stack:[]});
   var hist = loadJSON(HIST_KEY, []);
   var lastKeyAt = 0;
-  var stream, ctx, proc, wake, ring, rate, total, noise, blocks, mode = "off", trig, peakV, peakAt, coolUntil;
+  var stream, ctx, proc, wake, ring, rate, total, noise, blocks, mode = "off", trig, peakV, peakAt, coolUntil, beat;
 
   function saveAll(){try{localStorage.setItem(STATE_KEY,JSON.stringify(st));localStorage.setItem(HIST_KEY,JSON.stringify(hist))}catch(e){}}
   function hm(t){var d=new Date(t);return String(d.getHours()).padStart(2,"0")+":"+String(d.getMinutes()).padStart(2,"0")}
@@ -174,10 +185,30 @@ li span:last-child{color:var(--mute);font-variant-numeric:tabular-nums;white-spa
     if(mode === "wait" && total >= peakAt+POST*rate){
       var clip = slice(Math.round(peakAt-PRE*rate), Math.round(peakAt+POST*rate));
       mode = "cool"; coolUntil = peakAt+(POST+COOL)*rate;
-      dlog("送信 最大音量="+peakV.toFixed(3)+" / "+clip.length+"サンプル");
-      judge(clip, rate, false);
+      setPending(clip, rate, peakV);
+      if(peakV < MIN_SEND_PEAK){
+        dlog("小さいので送信しません 最大音量="+peakV.toFixed(3));
+        msg("待機中…音を待っています");
+      }else{
+        dlog("送信 最大音量="+peakV.toFixed(3)+" / "+clip.length+"サンプル");
+        judge(clip, rate, false);
+      }
     }
     if(mode === "cool" && total >= coolUntil){mode = "idle"}
+  }
+
+  async function ensureServer(){
+    for(var i=0;i<30;i++){
+      var ctl = new AbortController(), timer = setTimeout(function(){ctl.abort()}, 8000);
+      try{
+        var r = await fetch("/api/health",{cache:"no-store",signal:ctl.signal});
+        clearTimeout(timer);
+        if(r.ok){var j = await r.json(); if(j.model_loaded){dlog("サーバー確認OK"); return true}}
+      }catch(e){clearTimeout(timer)}
+      msg("サーバーを起動しています…（最大1分ほどかかります）"); dlog("サーバー確認中 "+(i+1)+"回目");
+      await new Promise(function(res){setTimeout(res,3000)});
+    }
+    return false;
   }
 
   async function getWake(){
@@ -187,6 +218,7 @@ li span:last-child{color:var(--mute);font-variant-numeric:tabular-nums;white-spa
 
   async function start(){
     $("start").disabled = true;
+    if(!(await ensureServer())){msg("サーバーに接続できません。しばらくしてから、もう一度お試しください。"); $("start").disabled = false; return}
     try{
       stream = await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false,channelCount:1}});
     }catch(e){msg("マイクを使えません（"+e.name+"）。ブラウザの設定でマイクを許可してください。"); $("start").disabled = false; return}
@@ -206,11 +238,12 @@ li span:last-child{color:var(--mute);font-variant-numeric:tabular-nums;white-spa
     mode = "idle"; $("stop").disabled = false;
     await getWake();
     dlog("マイク開始 "+rate+"Hz / 画面の消灯防止: "+(wake ? "有効" : "無効"));
+    beat = setInterval(function(){fetch("/api/health",{cache:"no-store"}).catch(function(){})}, 240000);
     msg(rate<24000 ? "サンプリングレートが低い("+rate+"Hz)です。Bluetoothを外してください。" : "待機中…音を待っています ("+rate+"Hz)");
   }
 
   function stop(){
-    mode = "off";
+    mode = "off"; clearInterval(beat);
     if(proc){proc.disconnect(); proc.onaudioprocess = null}
     if(stream) stream.getTracks().forEach(function(t){t.stop()});
     if(ctx) ctx.close();
@@ -228,6 +261,90 @@ li span:last-child{color:var(--mute);font-variant-numeric:tabular-nums;white-spa
       await judge(ch.slice(0, Math.min(ch.length, Math.round(audio.sampleRate*6))), audio.sampleRate, true);
     }catch(e){msg("サンプル音源が見つかりません（app/static/samples/"+name+".wav）")}
   }
+
+  // ZIP-START
+  var CRC = (function(){var t = [];for(var n=0;n<256;n++){var c = n;for(var k=0;k<8;k++)c = c&1 ? 0xEDB88320^(c>>>1) : c>>>1;t[n] = c>>>0}return t})();
+  function crc32(b){var c = 0xFFFFFFFF;for(var i=0;i<b.length;i++)c = CRC[(c^b[i])&255]^(c>>>8);return (c^0xFFFFFFFF)>>>0}
+  function wavBytes(pcm, rate){
+    var n = pcm.length*2, v = new DataView(new ArrayBuffer(44+n));
+    function str(o, t){for(var i=0;i<t.length;i++)v.setUint8(o+i, t.charCodeAt(i))}
+    str(0,"RIFF"); v.setUint32(4,36+n,true); str(8,"WAVE"); str(12,"fmt "); v.setUint32(16,16,true);
+    v.setUint16(20,1,true); v.setUint16(22,1,true); v.setUint32(24,rate,true); v.setUint32(28,rate*2,true);
+    v.setUint16(32,2,true); v.setUint16(34,16,true); str(36,"data"); v.setUint32(40,n,true);
+    for(var i=0;i<pcm.length;i++)v.setInt16(44+i*2, pcm[i], true);
+    return new Uint8Array(v.buffer);
+  }
+  function makeZip(files){   // 圧縮なし(store)のZIP
+    var enc = new TextEncoder(), parts = [], central = [], offset = 0;
+    files.forEach(function(f){
+      var name = enc.encode(f.name), crc = crc32(f.data), size = f.data.length;
+      var lh = new DataView(new ArrayBuffer(30));
+      lh.setUint32(0,0x04034b50,true); lh.setUint16(4,20,true); lh.setUint16(6,0x0800,true); lh.setUint16(8,0,true);
+      lh.setUint16(10,0,true); lh.setUint16(12,0x21,true); lh.setUint32(14,crc,true); lh.setUint32(18,size,true);
+      lh.setUint32(22,size,true); lh.setUint16(26,name.length,true); lh.setUint16(28,0,true);
+      parts.push(new Uint8Array(lh.buffer), name, f.data);
+      var ch = new DataView(new ArrayBuffer(46));
+      ch.setUint32(0,0x02014b50,true); ch.setUint16(4,20,true); ch.setUint16(6,20,true); ch.setUint16(8,0x0800,true);
+      ch.setUint16(10,0,true); ch.setUint16(12,0,true); ch.setUint16(14,0x21,true); ch.setUint32(16,crc,true);
+      ch.setUint32(20,size,true); ch.setUint32(24,size,true); ch.setUint16(28,name.length,true);
+      ch.setUint32(42,offset,true);
+      central.push(new Uint8Array(ch.buffer), name);
+      offset += 30 + name.length + size;
+    });
+    var cdSize = 0; central.forEach(function(c){cdSize += c.length});
+    var end = new DataView(new ArrayBuffer(22));
+    end.setUint32(0,0x06054b50,true); end.setUint16(8,files.length,true); end.setUint16(10,files.length,true);
+    end.setUint32(12,cdSize,true); end.setUint32(16,offset,true);
+    return new Blob(parts.concat(central, [new Uint8Array(end.buffer)]), {type:"application/zip"});
+  }
+  // ZIP-END
+
+  // ---- 収集モード（URLの末尾に #collect を付けて開いたときだけ表示）
+  var store = [], pending = null;
+  function showCollect(){$("collect").hidden = location.hash !== "#collect"}
+  function updateCollect(){
+    var c = {lock:0, unlock:0, door:0, other:0}; store.forEach(function(x){c[x.label]++});
+    $("counts").textContent = "貯めた数: "+store.length+"件（施錠 "+c.lock+" / 開錠 "+c.unlock+" / ドア "+c.door+" / その他 "+c.other+"）";
+    $("pendingInfo").textContent = pending ? "直前のクリップ: 最大音量 "+pending.peak.toFixed(3)+"（ラベルを選んでください）" : "直前のクリップ: なし";
+    document.querySelectorAll("button[data-label]").forEach(function(b){b.disabled = !pending});
+  }
+  function setPending(clip, sr, peak){
+    if(location.hash !== "#collect") return;
+    var pcm = new Int16Array(clip.length);
+    for(var i=0;i<clip.length;i++){var v = Math.max(-1,Math.min(1,clip[i]));pcm[i] = v<0 ? v*32768 : v*32767}
+    pending = {pcm:pcm, rate:sr, peak:peak}; updateCollect();
+  }
+  async function saveZip(){
+    if(!store.length){msg("貯めたクリップがありません"); return}
+    var counters = {lock:0, unlock:0, door:0, other:0};
+    var files = store.map(function(x){
+      counters[x.label]++;
+      return {name: x.label+"/"+x.label+"_"+String(counters[x.label]).padStart(3,"0")+".wav", data: wavBytes(x.pcm, x.rate)};
+    });
+    var d = new Date(), p = function(n){return String(n).padStart(2,"0")};
+    var fname = "locklog_clips_"+d.getFullYear()+p(d.getMonth()+1)+p(d.getDate())+"_"+p(d.getHours())+p(d.getMinutes())+".zip";
+    var blob = makeZip(files), file = new File([blob], fname, {type:"application/zip"});
+    try{
+      if(navigator.canShare && navigator.canShare({files:[file]})){await navigator.share({files:[file], title:fname}); dlog("共有: "+fname); return}
+    }catch(e){if(e && e.name === "AbortError") return}
+    var url = URL.createObjectURL(blob), a = document.createElement("a");
+    a.href = url; a.download = fname; document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(function(){URL.revokeObjectURL(url)}, 10000); dlog("ダウンロード: "+fname);
+  }
+  document.querySelectorAll("button[data-label]").forEach(function(b){
+    b.addEventListener("click", function(){
+      if(!pending) return;
+      if(b.dataset.label) store.push({label:b.dataset.label, pcm:pending.pcm, rate:pending.rate});
+      pending = null; updateCollect();
+    });
+  });
+  $("saveZip").addEventListener("click", saveZip);
+  $("clearStore").addEventListener("click", function(){
+    if(store.length && !confirm("貯めたクリップを、すべて消しますか？")) return;
+    store = []; pending = null; updateCollect();
+  });
+  window.addEventListener("hashchange", showCollect);
+  showCollect(); updateCollect();
 
   $("start").addEventListener("click", start);
   $("stop").addEventListener("click", stop);
