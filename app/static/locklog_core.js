@@ -67,12 +67,43 @@
     }
   }
 
-  // 窓付きsincによるリサンプリング
+  function gcd(a, b) { while (b) { var t = a % b; a = b; b = t; } return a; }
+
+  // 窓付きsincによるリサンプリング（重みは、位相ごとに1度だけ計算して使い回す）
   function resample(x, origSr, targetSr) {
-    var n, idx, d, u, w;
     if (origSr === targetSr) return Float64Array.from(x);
     var scale = Math.min(1, targetSr / origSr), half = HALF_WIDTH / scale, reach = Math.ceil(half);
-    var nOut = Math.floor(x.length * targetSr / origSr), out = new Float64Array(nOut), step = origSr / targetSr;
+    var nOut = Math.floor(x.length * targetSr / origSr);
+    if (!(Number.isInteger(origSr) && Number.isInteger(targetSr))) return resampleSlow(x, origSr, targetSr, nOut);
+    var g = gcd(origSr, targetSr), inStep = origSr / g, period = targetSr / g, taps = 2 * reach + 1;
+    var table = new Float64Array(period * taps), out = new Float64Array(nOut), r, o, n, q;
+    for (r = 0; r < period; r++) {
+      var frac = ((r * inStep) % period) / period, wsum = 0, row = r * taps;
+      for (o = 0; o < taps; o++) {
+        var dd = frac - (o - reach);
+        if (Math.abs(dd) >= half) continue;
+        var uu = dd * scale;
+        var ww = (uu === 0 ? 1 : Math.sin(Math.PI * uu) / (Math.PI * uu)) * 0.5 * (1 + Math.cos(Math.PI * dd / half));
+        table[row + o] = ww; wsum += ww;
+      }
+      for (o = 0; o < taps; o++) table[row + o] /= wsum;
+    }
+    for (n = 0; n < nOut; n++) {
+      var base = Math.floor(n * inStep / period), row2 = (n % period) * taps, acc = 0;
+      for (q = 0; q < taps; q++) {
+        var ix = base + q - reach;
+        if (ix >= 0 && ix < x.length) acc += x[ix] * table[row2 + q];
+      }
+      out[n] = acc;
+    }
+    return out;
+  }
+
+  // 整数でないレート用の、遅いが一般的な版
+  function resampleSlow(x, origSr, targetSr, nOut) {
+    var n, idx, d, u, w;
+    var scale = Math.min(1, targetSr / origSr), half = HALF_WIDTH / scale, reach = Math.ceil(half);
+    var out = new Float64Array(nOut), step = origSr / targetSr;
     for (n = 0; n < nOut; n++) {
       var pos = n * step, base = Math.floor(pos), wsum = 0, acc = 0;
       for (var o = -reach; o <= reach; o++) {
@@ -100,7 +131,7 @@
   }
 
   // 音声（Float32Array など）から、55個の特徴量を作る
-  function extractFeatures(audio, sr) {
+  function extractFeatures(audio, sr, topDb) {
     var x = cropAroundPeak(resample(audio, sr, TARGET_SR)), n, t, c;
     var top = 0;
     for (n = 0; n < x.length; n++) top = Math.max(top, Math.abs(x[n]));
@@ -111,7 +142,7 @@
     padded.set(x, pad);
 
     var re = new Float64Array(N_FFT), im = new Float64Array(N_FFT), power = new Float64Array(NBINS);
-    var mfcc = [], rms = new Float64Array(nFrames), centroid = new Float64Array(nFrames), logMel = new Float64Array(N_MELS);
+    var mfcc = [], logs = [], maxLog = -Infinity, rms = new Float64Array(nFrames), centroid = new Float64Array(nFrames);
     for (t = 0; t < nFrames; t++) {
       var sq = 0;
       for (i = 0; i < N_FFT; i++) { var v = padded[t * HOP + i]; sq += v * v; re[i] = v * WINDOW[i]; im[i] = 0; }
@@ -123,13 +154,20 @@
         var mag = Math.sqrt(power[k]); total += mag; weighted += mag * FREQS[k];
       }
       centroid[t] = total < 1e-12 ? 0 : weighted / total;
+      var lm = new Float64Array(N_MELS);
       for (j = 0; j < N_MELS; j++) {
         var e = 0, row = BANK[j];
         for (k = 0; k < NBINS; k++) e += row[k] * power[k];
-        logMel[j] = 10 * Math.log10(Math.max(e, 1e-10));
+        lm[j] = 10 * Math.log10(Math.max(e, 1e-10));
+        if (lm[j] > maxLog) maxLog = lm[j];
       }
-      var coef = new Float64Array(N_MFCC);
-      for (c = 0; c < N_MFCC; c++) { var s2 = 0, drow = DCT[c]; for (j = 0; j < N_MELS; j++) s2 += drow[j] * logMel[j]; coef[c] = s2; }
+      logs.push(lm);
+    }
+    var useFloor = topDb !== null && topDb !== undefined, floor = maxLog - (useFloor ? topDb : 0);
+    for (t = 0; t < nFrames; t++) {
+      var lmt = logs[t], coef = new Float64Array(N_MFCC);
+      if (useFloor) for (j = 0; j < N_MELS; j++) if (lmt[j] < floor) lmt[j] = floor;
+      for (c = 0; c < N_MFCC; c++) { var s2 = 0, drow = DCT[c]; for (j = 0; j < N_MELS; j++) s2 += drow[j] * lmt[j]; coef[c] = s2; }
       mfcc.push(coef);
     }
 
@@ -177,7 +215,7 @@
     resample: resample,
     extractFeatures: extractFeatures,
     predictKey: predictKey,
-    predict: function (model, audio, sr) { return predictKey(model, extractFeatures(audio, sr)); }
+    predict: function (model, audio, sr) { return predictKey(model, extractFeatures(audio, sr, model.top_db)); }
   };
   if (typeof module !== "undefined" && module.exports) module.exports = api; else root.LockLog = api;
 })(typeof self !== "undefined" ? self : this);

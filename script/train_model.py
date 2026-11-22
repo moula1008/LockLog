@@ -11,7 +11,7 @@ from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
 
-from features import POST_SEC, PRE_SEC, TARGET_SR
+from features import POST_SEC, PRE_SEC, TARGET_SR, TOP_DB
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -54,6 +54,7 @@ def export_json(model, feature_columns, path):
         "sigmoid_a": float(sigmoid.a_),
         "sigmoid_b": float(sigmoid.b_),
         "positive_class": "key",
+        "top_db": TOP_DB,
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")

@@ -11,6 +11,7 @@ N_MFCC = 13
 N_MELS = 40
 N_FFT = 1024
 HOP = 256
+TOP_DB = 80.0     # メルのdB値を、最大値からこの幅より下には下げない（None にすると無効）
 PRE_SEC = 0.2       # ピークの何秒前から切り出すか
 POST_SEC = 0.8      # ピークの何秒後まで切り出すか
 HALF_WIDTH = 16     # リサンプリングの、sinc関数の片側の長さ（ゼロ交差の数）
@@ -110,6 +111,8 @@ def extract_feature_dict(audio, sr=TARGET_SR, crop=True):
     power = spectrum.real ** 2 + spectrum.imag ** 2
 
     log_mel = 10.0 * np.log10(np.maximum(power @ _BANK.T, 1e-10))
+    if TOP_DB is not None:
+        log_mel = np.maximum(log_mel, log_mel.max() - TOP_DB)
     mfcc = log_mel @ _DCT.T                                  # (フレーム数, 13)
 
     rms = np.sqrt(np.mean(frames ** 2, axis=1))
