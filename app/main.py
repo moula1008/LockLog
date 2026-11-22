@@ -3,7 +3,6 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import joblib
-import librosa
 import numpy as np
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Request
@@ -27,10 +26,25 @@ MAX_BODY_BYTES = 2_000_000
 state = {}
 
 
+def warm_up(bundle):
+    """起動時に1回だけ試しに判定して、初回の遅さ（ライブラリの準備）を済ませておく"""
+    rate = 48000
+    noise = np.random.default_rng(0).normal(0, 0.05, rate * 3).astype(np.float32)
+    features = extract_feature_dict(noise, sr=rate)
+    columns = bundle["feature_columns"]
+    X = pd.DataFrame([[features[name] for name in columns]], columns=columns)
+    bundle["pipeline"].predict_proba(X)
+
+
 @asynccontextmanager
 async def lifespan(app):
     if MODEL_PATH.is_file():
-        state["bundle"] = joblib.load(MODEL_PATH)
+        bundle = joblib.load(MODEL_PATH)
+        try:
+            warm_up(bundle)
+        except Exception as error:  # 準備に失敗しても、サーバー自体は起動する
+            print("warm-up failed:", error)
+        state["bundle"] = bundle
     yield
     state.clear()
 
@@ -73,11 +87,7 @@ async def predict(request: Request, sample_rate: int):
     if float(np.max(np.abs(samples))) < MIN_PEAK:
         raise HTTPException(status_code=422, detail="音が小さすぎます")
 
-    target_rate = bundle["sample_rate"]
-    if sample_rate != target_rate:
-        samples = librosa.resample(samples, orig_sr=sample_rate, target_sr=target_rate)
-
-    features = extract_feature_dict(samples, sr=target_rate)
+    features = extract_feature_dict(samples, sr=sample_rate)   # レートの変換も、この中で行う
     columns = bundle["feature_columns"]
     X = pd.DataFrame([[features[name] for name in columns]], columns=columns)
     probabilities = bundle["pipeline"].predict_proba(X)[0]

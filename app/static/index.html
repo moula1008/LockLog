@@ -49,7 +49,7 @@ li span:last-child{color:var(--mute);font-variant-numeric:tabular-nums;white-spa
     <div class="row" style="margin-top:0"><button class="go" id="start">マイクを開始</button><button id="stop" disabled>停止</button></div>
     <div class="bar"><i id="fill"></i></div>
     <p id="msg"></p>
-    <p class="note">画面を点けたまま使います。Bluetoothイヤホンは外してください。鍵の音を検出するたびに、状態が切り替わります。</p>
+    <p class="note">画面を点けたまま使います。Bluetoothイヤホンは外してください。鍵の音を検出するたびに、状態が切り替わります。判定はこの端末の中で行い、音声は外部に送信されません。</p>
   </section>
 
   <section class="card">
@@ -69,11 +69,20 @@ li span:last-child{color:var(--mute);font-variant-numeric:tabular-nums;white-spa
   <section class="card" id="collect" hidden>
     <div class="k">収集モード（データ集め用）</div>
     <p class="note" style="margin-top:4px">音を検出するたびに、直前のクリップへラベルを付けて貯めます。クリップはこの端末の中だけに保存され、サーバーには保存されません。</p>
+    <div class="k" style="margin-top:8px">自動ラベル（ポケットに入れたまま集めるとき）</div>
+    <select id="autoMode" style="width:100%;font:inherit;padding:10px;border-radius:10px;border:1px solid var(--line);background:var(--card);color:var(--ink);margin-top:4px">
+      <option value="">なし（1件ずつ、手でラベルを付ける）</option>
+      <option value="alt:unlock">鍵：開錠から交互（開錠→施錠→開錠…）</option>
+      <option value="alt:lock">鍵：施錠から交互（施錠→開錠→施錠…）</option>
+      <option value="door">ドア（開け閉め）</option>
+      <option value="other">その他の物音</option>
+    </select>
     <div id="pendingInfo" class="k" style="margin-top:8px">直前のクリップ: なし</div>
     <div class="row"><button data-label="lock" disabled>施錠</button><button data-label="unlock" disabled>開錠</button><button data-label="door" disabled>ドア</button></div>
     <div class="row" style="margin-top:0"><button data-label="other" disabled>その他</button><button data-label="" disabled>捨てる</button></div>
     <div id="counts" class="k" style="margin-top:8px">貯めた数: 0件</div>
-    <div class="row"><button id="saveZip">ZIPで保存</button><button id="clearStore">全部消す</button></div>
+    <div class="row"><button id="undoClip">最後の1件を消す</button></div>
+    <div class="row" style="margin-top:0"><button id="saveZip">ZIPで保存</button><button id="clearStore">全部消す</button></div>
   </section>
 
   <section class="card">
@@ -83,12 +92,14 @@ li span:last-child{color:var(--mute);font-variant-numeric:tabular-nums;white-spa
   </section>
 </main>
 
+<script src="locklog_core.js"></script>
 <script>
 (function(){
   var $ = function(id){return document.getElementById(id)};
   var STATE_KEY = "locklog-state2", HIST_KEY = "locklog-history2";
   var MERGE_MS = 8000, MAXH = 60;                         // 8秒以内に続いた鍵の音は、1回の操作とみなす
   var PRE = 1.0, POST = 2.0, PEAKWIN = 0.6, COOL = 0.5;   // 切り出し: 最大音の前1秒・後2秒
+  var THRESHOLD = 0.5;                                     // 「鍵の確率」がこれ以上なら、鍵の操作とみなす
   var MIN_SEND_PEAK = 0.04;                                // これより小さい音は、雑音とみなして送らない
   var JA = {locked:"施錠済み", unlocked:"開錠中"};
 
@@ -102,6 +113,11 @@ li span:last-child{color:var(--mute);font-variant-numeric:tabular-nums;white-spa
   function hm(t){var d=new Date(t);return String(d.getHours()).padStart(2,"0")+":"+String(d.getMinutes()).padStart(2,"0")}
   function ago(t){var m=Math.floor((Date.now()-t)/60000);return m<1?"たった今":m<60?m+"分前":Math.floor(m/60)+"時間前"}
   function msg(t){$("msg").textContent = t}
+  var model = null;
+  var modelReady = fetch("locklog_model.json", {cache:"no-cache"}).then(function(r){
+    if(!r.ok) throw new Error("HTTP "+r.status); return r.json();
+  }).then(function(m){model = m; dlog("モデルを読み込みました（特徴量 "+m.feature_names.length+" 個）")})
+    .catch(function(e){dlog("モデルを読み込めません: "+e); msg("モデルを読み込めませんでした。ページを再読み込みしてください。")});
   var dl = [];
   function dlog(t){
     var d = new Date(), p = function(n){return String(n).padStart(2,"0")};
@@ -148,19 +164,18 @@ li span:last-child{color:var(--mute);font-variant-numeric:tabular-nums;white-spa
 
   async function judge(clip, sr, fromDemo){
     msg("判定中…");
-    var pcm = new Int16Array(clip.length);
-    for(var i=0;i<clip.length;i++){var v=Math.max(-1,Math.min(1,clip[i]));pcm[i]=v<0?v*32768:v*32767}
-    var ctl = new AbortController(), timer = setTimeout(function(){ctl.abort()}, 60000);
+    await modelReady;
+    if(!model){msg("モデルを読み込めませんでした。ページを再読み込みしてください。"); return}
+    await new Promise(function(r){setTimeout(r, 20)});        // 画面の表示を先に更新する
     try{
-      var r = await fetch("/api/predict?sample_rate="+sr,{method:"POST",headers:{"Content-Type":"application/octet-stream"},body:pcm.buffer,signal:ctl.signal});
-      clearTimeout(timer);
-      if(!r.ok){var e = await r.json().catch(function(){return {}}); dlog("応答エラー "+r.status+" "+(e.detail||"")); msg("判定できませんでした: "+(e.detail||r.status)); return}
-      var res = await r.json();
-      dlog("応答 "+res.decision+" (鍵の確率 "+Math.round(res.confidence*100)+"%)");
-      if(fromDemo) lastKeyAt = 0;                       // サンプルのボタンは、毎回1回の操作として扱う
-      if(res.decision === "key") onKey(res.confidence); else {log("other", res.confidence); done()}
+      var t0 = performance.now();
+      var p = LockLog.predict(model, clip, sr);
+      var decision = p >= THRESHOLD ? "key" : "other";
+      dlog("判定 "+decision+"（鍵の確率 "+Math.round(p*100)+"% / "+Math.round(performance.now()-t0)+"ms）");
+      if(fromDemo) lastKeyAt = 0;                             // サンプルのボタンは、毎回1回の操作として扱う
+      if(decision === "key") onKey(p); else {log("other", p); done()}
       msg(mode==="off" ? "" : "待機中…音を待っています");
-    }catch(e){clearTimeout(timer); dlog("通信または処理のエラー: "+e); msg("判定に失敗しました（診断ログを見てください）")}
+    }catch(e){dlog("判定のエラー: "+e); msg("判定に失敗しました（診断ログを見てください）")}
   }
 
   function slice(from, to){var out = new Float32Array(to-from); for(var i=0;i<out.length;i++) out[i] = ring[(from+i)%ring.length]; return out}
@@ -197,19 +212,7 @@ li span:last-child{color:var(--mute);font-variant-numeric:tabular-nums;white-spa
     if(mode === "cool" && total >= coolUntil){mode = "idle"}
   }
 
-  async function ensureServer(){
-    for(var i=0;i<30;i++){
-      var ctl = new AbortController(), timer = setTimeout(function(){ctl.abort()}, 8000);
-      try{
-        var r = await fetch("/api/health",{cache:"no-store",signal:ctl.signal});
-        clearTimeout(timer);
-        if(r.ok){var j = await r.json(); if(j.model_loaded){dlog("サーバー確認OK"); return true}}
-      }catch(e){clearTimeout(timer)}
-      msg("サーバーを起動しています…（最大1分ほどかかります）"); dlog("サーバー確認中 "+(i+1)+"回目");
-      await new Promise(function(res){setTimeout(res,3000)});
-    }
-    return false;
-  }
+  async function ensureServer(){await modelReady; return !!model}
 
   async function getWake(){
     if(!("wakeLock" in navigator)) return;
@@ -238,7 +241,6 @@ li span:last-child{color:var(--mute);font-variant-numeric:tabular-nums;white-spa
     mode = "idle"; $("stop").disabled = false;
     await getWake();
     dlog("マイク開始 "+rate+"Hz / 画面の消灯防止: "+(wake ? "有効" : "無効"));
-    beat = setInterval(function(){fetch("/api/health",{cache:"no-store"}).catch(function(){})}, 240000);
     msg(rate<24000 ? "サンプリングレートが低い("+rate+"Hz)です。Bluetoothを外してください。" : "待機中…音を待っています ("+rate+"Hz)");
   }
 
@@ -312,8 +314,27 @@ li span:last-child{color:var(--mute);font-variant-numeric:tabular-nums;white-spa
     if(location.hash !== "#collect") return;
     var pcm = new Int16Array(clip.length);
     for(var i=0;i<clip.length;i++){var v = Math.max(-1,Math.min(1,clip[i]));pcm[i] = v<0 ? v*32768 : v*32767}
+    var auto = $("autoMode").value;
+    if(auto){
+      var label = auto;
+      if(auto.indexOf("alt:") === 0){
+        var first = auto.slice(4), second = first === "unlock" ? "lock" : "unlock";
+        label = autoCount % 2 === 0 ? first : second; autoCount++;
+      }
+      store.push({label:label, pcm:pcm, rate:sr}); pending = null; updateCollect();
+      dlog("自動で追加: "+label+"（最大音量 "+peak.toFixed(3)+"）");
+      msg("自動で追加しました（"+store.length+"件目）");
+      return;
+    }
     pending = {pcm:pcm, rate:sr, peak:peak}; updateCollect();
   }
+  var autoCount = 0;
+  $("autoMode").addEventListener("change", function(){autoCount = 0});
+  $("undoClip").addEventListener("click", function(){
+    var last = store.pop();
+    if(last && $("autoMode").value.indexOf("alt:") === 0) autoCount = Math.max(0, autoCount-1);
+    updateCollect();
+  });
   async function saveZip(){
     if(!store.length){msg("貯めたクリップがありません"); return}
     var counters = {lock:0, unlock:0, door:0, other:0};

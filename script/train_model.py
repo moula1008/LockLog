@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import joblib
@@ -17,6 +18,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 FEATURES_PATH = BASE_DIR / "dataset" / "mfcc_features.csv"
 MODEL_DIR = BASE_DIR / "models"
 MODEL_PATH = MODEL_DIR / "locklog_model.joblib"
+MODEL_JSON_PATH = BASE_DIR / "app" / "static" / "locklog_model.json"   # ブラウザで判定するためのモデル
 EXPECTED_LABELS = ("lock", "unlock", "door", "other")
 KEY_LABELS = ("lock", "unlock")   # この2つを「鍵の操作(key)」にまとめる
 RANDOM_STATE = 42
@@ -31,6 +33,30 @@ def make_model():
         StandardScaler(),
         CalibratedClassifierCV(svm, method="sigmoid", cv=3, ensemble=False),
     )
+
+
+def export_json(model, feature_columns, path):
+    """ブラウザ(JavaScript)で判定するために、モデルの中身をJSONで書き出す"""
+    scaler = model.named_steps["standardscaler"]
+    calibrated = model.named_steps["calibratedclassifiercv"]
+    inner = calibrated.calibrated_classifiers_[0]
+    svm = getattr(inner, "estimator", None) or inner.base_estimator
+    sigmoid = inner.calibrators[0]
+    assert list(calibrated.classes_) == ["key", "other"], "クラスの順番が想定と違います"
+    payload = {
+        "feature_names": list(feature_columns),
+        "mean": scaler.mean_.tolist(),
+        "scale": scaler.scale_.tolist(),
+        "gamma": float(svm._gamma),
+        "intercept": float(svm.intercept_[0]),
+        "dual_coef": np.round(svm.dual_coef_[0], 10).tolist(),
+        "support_vectors": np.round(svm.support_vectors_, 8).tolist(),
+        "sigmoid_a": float(sigmoid.a_),
+        "sigmoid_b": float(sigmoid.b_),
+        "positive_class": "key",
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
 
 
 def main():
@@ -103,6 +129,15 @@ def main():
             f"   {detected[original == 'door'].mean():6.1%}   |   {detected[original == 'other'].mean():6.1%}"
         )
 
+    web = np.array([str(name).startswith("locklog_clips_") for name in groups])
+    if web.any():
+        print(f"\n=== ブラウザで集めたクリップだけの結果（{int(web.sum())}件・録音の単位 {len(set(groups[web]))}個・しきい値0.5） ===")
+        print("鍵の音(lock/unlock)は「keyと判定された割合」が高いほど良く、door/otherは低いほど良い")
+        for label in EXPECTED_LABELS:
+            mask = web & (original == label)
+            if mask.any():
+                print(f"  {label:<7} {int(mask.sum()):3d}件   keyと判定: {(p_key[mask] >= 0.5).mean():6.1%}")
+
     wrong = np.flatnonzero(predictions != y)
     print(f"\n誤分類したファイル（1回目の分割）: {wrong.size}件")
     for index in wrong:
@@ -123,7 +158,9 @@ def main():
         },
         MODEL_PATH,
     )
+    export_json(model, feature_columns, MODEL_JSON_PATH)
     print(f"\n全{len(data)}件で学習したモデルを保存しました: {MODEL_PATH}")
+    print(f"ブラウザ用のモデルを書き出しました: {MODEL_JSON_PATH}（{MODEL_JSON_PATH.stat().st_size // 1024} KB）")
 
 
 if __name__ == "__main__":
