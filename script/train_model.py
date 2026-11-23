@@ -25,6 +25,7 @@ RANDOM_STATE = 42
 N_SPLITS = 5
 N_REPEATS = 5
 THRESHOLDS = (0.3, 0.4, 0.5, 0.6, 0.7, 0.8)
+USE_DOMAIN_WEIGHTS = True   # ブラウザで集めた音と、それ以外の録音を、ラベルの中で同じ重さにする
 
 
 def make_model():
@@ -58,6 +59,19 @@ def export_json(model, feature_columns, path):
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+
+
+def domain_weights(y, groups):
+    """ブラウザで集めた音(locklog_clips_*)と、それ以外の録音を、ラベルの中で同じ重さにする"""
+    web = np.array([str(name).startswith("locklog_clips_") for name in groups])
+    weights = np.ones(len(y))
+    for label in np.unique(y):
+        in_label = y == label
+        cells = [in_label & web, in_label & ~web]
+        cells = [cell for cell in cells if cell.any()]
+        for cell in cells:
+            weights[cell] = in_label.sum() / len(cells) / cell.sum()
+    return weights, web
 
 
 def main():
@@ -99,10 +113,23 @@ def main():
     classes = np.array(["key", "other"])
     key_index = 0
 
+    weights, web = domain_weights(y, groups)
+    if not USE_DOMAIN_WEIGHTS:
+        weights = np.ones(len(y))
+    print("\n=== 学習の重み（ラベルの中で、ブラウザの音とそれ以外を、同じ重さにする） ===")
+    for label in ("key", "other"):
+        for name, mask in (("ブラウザ", web), ("それ以外", ~web)):
+            cell = (y == label) & mask
+            if cell.any():
+                print(f"  {label:<6} {name}: {int(cell.sum()):3d}件  1件あたりの重み {weights[cell][0]:.2f}")
+
     accuracies = []
     for repeat in range(N_REPEATS):
         cv = StratifiedGroupKFold(n_splits=N_SPLITS, shuffle=True, random_state=RANDOM_STATE + repeat)
-        probabilities = cross_val_predict(make_model(), X, y, cv=cv, groups=groups, method="predict_proba")
+        probabilities = cross_val_predict(
+            make_model(), X, y, cv=cv, groups=groups, method="predict_proba",
+            params={"calibratedclassifiercv__sample_weight": weights},
+        )
         accuracies.append(accuracy_score(y, classes[probabilities.argmax(axis=1)]))
         if repeat == 0:
             first = probabilities
@@ -130,7 +157,6 @@ def main():
             f"   {detected[original == 'door'].mean():6.1%}   |   {detected[original == 'other'].mean():6.1%}"
         )
 
-    web = np.array([str(name).startswith("locklog_clips_") for name in groups])
     if web.any():
         print(f"\n=== ブラウザで集めたクリップだけの結果（{int(web.sum())}件・録音の単位 {len(set(groups[web]))}個・しきい値0.5） ===")
         print("鍵の音(lock/unlock)は「keyと判定された割合」が高いほど良く、door/otherは低いほど良い")
@@ -138,6 +164,15 @@ def main():
             mask = web & (original == label)
             if mask.any():
                 print(f"  {label:<7} {int(mask.sum()):3d}件   keyと判定: {(p_key[mask] >= 0.5).mean():6.1%}")
+        web_keys = np.flatnonzero(web & (y == "key"))
+        if web_keys.size:
+            order = web_keys[np.argsort(p_key[web_keys])]
+            print("\nブラウザで集めた鍵のクリップを、keyの確率が低い順に（上位10件）:")
+            for index in order[:10]:
+                print(f"  {original[index]}/{data.loc[index, 'file']}: keyの確率 {p_key[index]:.2f}")
+            names = " ".join(f"{original[i]}/{data.loc[i, 'file']}" for i in order[:6])
+            print("波形の確認コマンド（上位6件）:")
+            print(f"  .\\.venv\\Scripts\\python.exe .\\script\\inspect_clips.py {names}")
 
     wrong = np.flatnonzero(predictions != y)
     print(f"\n誤分類したファイル（1回目の分割）: {wrong.size}件")
@@ -145,7 +180,7 @@ def main():
         print(f"  {original[index]}/{data.loc[index, 'file']}: 予測={predictions[index]} (keyの確率 {p_key[index]:.2f})")
 
     model = make_model()
-    model.fit(X, y)
+    model.fit(X, y, calibratedclassifiercv__sample_weight=weights)
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
     joblib.dump(
         {
