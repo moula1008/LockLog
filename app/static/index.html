@@ -85,7 +85,7 @@ li span:last-child{color:var(--mute);font-variant-numeric:tabular-nums;white-spa
     <div class="row" style="margin-top:0"><button id="saveZip">ZIPで保存</button><button id="clearStore">全部消す</button></div>
   </section>
 
-  <section class="card">
+  <section class="card" id="diag" hidden>
     <div class="k">診断ログ（不具合の調査用）</div>
     <pre id="dlog" style="margin:8px 0 0;font:12px/1.5 ui-monospace,Menlo,monospace;max-height:220px;overflow:auto;white-space:pre-wrap;word-break:break-all">まだありません</pre>
     <div class="row"><button id="copyLog">ログをコピー</button></div>
@@ -303,7 +303,7 @@ li span:last-child{color:var(--mute);font-variant-numeric:tabular-nums;white-spa
 
   // ---- 収集モード（URLの末尾に #collect を付けて開いたときだけ表示）
   var store = [], pending = null;
-  function showCollect(){$("collect").hidden = location.hash !== "#collect"}
+  function showCollect(){var on = location.hash === "#collect"; $("collect").hidden = !on; $("diag").hidden = !on}
   function updateCollect(){
     var c = {lock:0, unlock:0, door:0, other:0}; store.forEach(function(x){c[x.label]++});
     $("counts").textContent = "貯めた数: "+store.length+"件（施錠 "+c.lock+" / 開錠 "+c.unlock+" / ドア "+c.door+" / その他 "+c.other+"）";
